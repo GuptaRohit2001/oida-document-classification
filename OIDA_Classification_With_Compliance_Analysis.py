@@ -1,8 +1,7 @@
 import pandas as pd
 import numpy as np
-import re, warnings, zipfile, os
-from pathlib import Path
-from collections import Counter, defaultdict
+import re, warnings
+from collections import Counter
 warnings.filterwarnings('ignore')
 
 import nltk
@@ -50,6 +49,44 @@ import matplotlib.patches as mpatches
 import matplotlib.gridspec as gridspec
 import seaborn as sns
 
+
+
+def print_section(title, *lines, char='='):
+    print("\n" + char * 80)
+    print(title)
+    for line in lines:
+        print(line)
+    print(char * 80)
+
+
+def print_metrics(name, y_true, y_pred, extra=None):
+    print(f"\nAccuracy : {accuracy_score(y_true, y_pred) * 100:.2f}%")
+    print(f"F1-Macro : {f1_score(y_true, y_pred, average='macro'):.4f}")
+    if extra:
+        for label, value in extra:
+            print(f"{label:<9}: {value}")
+    print("\n" + classification_report(y_true, y_pred, digits=4))
+
+
+def _collect_topics(topics):
+    return {topic['label']: topic for topic in topics}
+
+
+def _print_discovered_groups(title, items):
+    if not items:
+        print(f"  ⚠  Could not discover {title.lower()} from this dataset.")
+        return
+
+    header = 'DISCOVERED TOPIC' if 'Regulatory' in title else 'DISCOVERED PRACTICE'
+    print(f"  {header:<35s}  {'DOCS':>5s}  {'%':>6s}  KEY PHRASES (auto-extracted)")
+    print("  " + "─" * 90)
+    for name, data in items.items():
+        bar = "█" * int(data['percentage'] / 5)
+        phrases = ' | '.join(data['top_phrases'][:3])
+        print(f"  {name:<35s}  {data['document_count']:>5d}  {data['percentage']:>5.1f}%  {bar}")
+        print(f"  {'':35s}  {'Phrases:':>8s}  \"{phrases}\"")
+        print()
+
 print("=" * 80)
 print("  PART 1 : Document Classification")
 print("  PART 2 : Compliance Analysis (Step A + B + C)")
@@ -89,50 +126,32 @@ class TextPreprocessor:
 def load_dataset(filepath):
     print(f"\nLoading : {filepath}")
 
-    def safe_read(file_obj, sep='|'):
-        """
-        Try multiple encodings to safely read CSV
-        """
-        for enc in ['utf-8', 'cp1252', 'latin1']:
-            try:
-                return pd.read_csv(file_obj, sep=sep,
-                                   encoding=enc,
-                                   on_bad_lines='skip',
-                                   low_memory=False)
-            except:
-                continue
-
-        # Fallback without separator assumption
-        for enc in ['utf-8', 'cp1252', 'latin1']:
-            try:
-                return pd.read_csv(file_obj,
-                                   encoding=enc,
-                                   on_bad_lines='skip',
-                                   low_memory=False)
-            except:
-                continue
-
+    def safe_read(file_obj):
+        for kwargs in ({'sep': '|'}, {}):
+            for enc in ('utf-8', 'cp1252', 'latin1'):
+                try:
+                    return pd.read_csv(
+                        file_obj, encoding=enc, on_bad_lines='skip',
+                        low_memory=False, **kwargs
+                    )
+                except Exception:
+                    continue
         return None
 
-    # ── HANDLE CSV FILE ────────────────────────────────────────
     df = safe_read(filepath)
-
     if df is None or df.empty:
         print("❌ Failed to read file with all encoding attempts.")
         return pd.DataFrame()
 
-    # ── FIX INDEX (if weird multi-index occurs) ─────────────────────
     if isinstance(df.index, pd.MultiIndex):
         df = df.reset_index(drop=True)
 
-    # ── AUTO-DETECT TEXT COLUMN ─────────────────────────────────────
-    text_col = next((c for c in df.columns
-                     if any(k in c.lower()
-                            for k in ['ocr', 'text', 'content', 'body'])), None)
-
+    text_col = next((
+        c for c in df.columns
+        if any(k in c.lower() for k in ('ocr', 'text', 'content', 'body'))
+    ), None)
     df['text'] = df[text_col].astype(str) if text_col else df.iloc[:, 0].astype(str)
 
-    # ── CREATE DOCUMENT ID ──────────────────────────────────────────
     if 'id' in df.columns:
         df['doc_id'] = df['id'].astype(str)
     elif 'bates' in df.columns:
@@ -140,7 +159,6 @@ def load_dataset(filepath):
     else:
         df['doc_id'] = 'doc_' + pd.Series(range(len(df))).astype(str)
 
-    # ── CLEAN DATA ──────────────────────────────────────────────────
     df = (
         df[df['text'].notna()]
         .pipe(lambda d: d[d['text'].str.len() > 50])
@@ -157,30 +175,31 @@ def load_dataset(filepath):
 
 def create_labels(df):
     print("\nCreating labels ...")
-    promo = ['sales','marketing','promote','promotional','market','physician',
-             'prescriber','prescription','revenue','profit','target','campaign',
-             'sell','aggressive','quota','incentive','bonus','pressure','goal',
-             'performance','distribution','detailing','advertise','commercial']
-    sci   = ['study','research','clinical','trial','data','efficacy','safety',
-             'patient','dose','treatment','results','findings','analysis',
-             'experiment','placebo','randomized','peer-review','hypothesis',
-             'methodology','statistical','controlled','cohort','endpoint']
-    reg   = ['regulation','regulatory','compliance','legal','fda','dea',
-             'government','law','court','litigation','lawsuit','enforcement',
-             'approval','attorney','judge','testimony','settlement','deposition',
-             'subpoena','investigation','violation','penalty','consent']
+    keywords = {
+        'promotional': ['sales','marketing','promote','promotional','market','physician',
+                        'prescriber','prescription','revenue','profit','target','campaign',
+                        'sell','aggressive','quota','incentive','bonus','pressure','goal',
+                        'performance','distribution','detailing','advertise','commercial'],
+        'scientific':  ['study','research','clinical','trial','data','efficacy','safety',
+                        'patient','dose','treatment','results','findings','analysis',
+                        'experiment','placebo','randomized','peer-review','hypothesis',
+                        'methodology','statistical','controlled','cohort','endpoint'],
+        'regulatory':  ['regulation','regulatory','compliance','legal','fda','dea',
+                        'government','law','court','litigation','lawsuit','enforcement',
+                        'approval','attorney','judge','testimony','settlement','deposition',
+                        'subpoena','investigation','violation','penalty','consent'],
+    }
+
     labels = []
     for text in df['text']:
-        t = text.lower()
-        p = sum(1 for k in promo if k in t)
-        s = sum(1 for k in sci   if k in t)
-        r = sum(1 for k in reg   if k in t)
-        if p == s == r:
+        lowered = text.lower()
+        scores = {label: sum(1 for word in words if word in lowered)
+                  for label, words in keywords.items()}
+        if len(set(scores.values())) == 1:
             labels.append('scientific' if len(text) > 8000 else 'promotional')
         else:
-            labels.append(max({'promotional': p, 'scientific': s, 'regulatory': r},
-                              key={'promotional': p, 'scientific': s,
-                                   'regulatory': r}.get))
+            labels.append(max(scores, key=scores.get))
+
     df['label'] = labels
     print("\n   Label Distribution:")
     for lbl, cnt in df['label'].value_counts().items():
@@ -192,9 +211,7 @@ def create_labels(df):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def train_random_forest(X_train, X_test, y_train, y_test):
-    print("\n" + "="*80)
-    print("PART 1 : RANDOM FOREST")
-    print("="*80)
+    print_section("PART 1 : RANDOM FOREST")
     max_feat = min(5000, len(X_train)*2)
     vec = TfidfVectorizer(max_features=max_feat, ngram_range=(1, 3),
                           max_df=0.9, min_df=1, sublinear_tf=True)
@@ -205,16 +222,11 @@ def train_random_forest(X_train, X_test, y_train, y_test):
                                 random_state=42, n_jobs=-1, oob_score=True)
     rf.fit(X_tr, y_train)
     pred = rf.predict(X_te)
-    print(f"\nAccuracy : {accuracy_score(y_test, pred)*100:.2f}%")
-    print(f"F1-Macro : {f1_score(y_test, pred, average='macro'):.4f}")
-    print(f"OOB      : {rf.oob_score_:.4f}")
-    print("\n" + classification_report(y_test, pred, digits=4))
+    print_metrics('Random Forest', y_test, pred, extra=[('OOB', f"{rf.oob_score_:.4f}")])
     return rf, vec, pred
 
 def train_ensemble(X_train, X_test, y_train, y_test, vec):
-    print("\n" + "="*80)
-    print("PART 1 : ENSEMBLE VOTING")
-    print("="*80)
+    print_section("PART 1 : ENSEMBLE VOTING")
     X_tr = vec.transform(X_train)
     X_te = vec.transform(X_test)
     ens = VotingClassifier(
@@ -230,15 +242,11 @@ def train_ensemble(X_train, X_test, y_train, y_test, vec):
         ], voting='hard', n_jobs=-1)
     ens.fit(X_tr, y_train)
     pred = ens.predict(X_te)
-    print(f"\nAccuracy : {accuracy_score(y_test, pred)*100:.2f}%")
-    print(f"F1-Macro : {f1_score(y_test, pred, average='macro'):.4f}")
-    print("\n" + classification_report(y_test, pred, digits=4))
+    print_metrics('Ensemble', y_test, pred)
     return ens, pred
 
 def train_bilstm(X_train, X_test, y_train, y_test, label_encoder):
-    print("\n" + "="*80)
-    print("PART 1 : BiLSTM")
-    print("="*80)
+    print_section("PART 1 : BiLSTM")
     y_tr_enc = label_encoder.transform(y_train)
     y_te_enc = label_encoder.transform(y_test)
     y_tr_cat = to_categorical(y_tr_enc)
@@ -280,9 +288,7 @@ def train_bilstm(X_train, X_test, y_train, y_test, label_encoder):
               class_weight=cw_dict, verbose=1)
     pred = label_encoder.inverse_transform(
                np.argmax(model.predict(X_te, verbose=0), axis=1))
-    print(f"\nBiLSTM Accuracy : {accuracy_score(y_test, pred)*100:.2f}%")
-    print(f"BiLSTM F1       : {f1_score(y_test, pred, average='macro'):.4f}")
-    print("\n" + classification_report(y_test, pred, digits=4))
+    print_metrics('BiLSTM', y_test, pred)
     return model, pred
 
 def plot_confusion_matrices(y_test, predictions_dict, labels):
@@ -308,7 +314,7 @@ def plot_confusion_matrices(y_test, predictions_dict, labels):
     print("   ✓ Saved: confusion_matrices.png")
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 2 — COMPLIANCE ANALYSIS                                            ║  
+# ║  PART 2 — COMPLIANCE ANALYSIS                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def _cluster_documents(df_subset, n_clusters, label_prefix,
@@ -399,92 +405,50 @@ def _cluster_documents(df_subset, n_clusters, label_prefix,
 # ── Step A : Discover regulatory topics from regulatory documents ────────────
 
 def extract_regulatory_requirements(df_reg, n_topics=8):
-    print("\n" + "="*80)
-    print("PART 2 — STEP A : DISCOVERING REGULATORY TOPICS  (Fully Dynamic)")
-    print("  Method : TF-IDF (1-3 grams)  →  LSA  →  K-Means clustering")
-    print("  No hardcoded categories or keyword lists.")
-    print("="*80)
+    print_section(
+        "PART 2 — STEP A : DISCOVERING REGULATORY TOPICS  (Fully Dynamic)",
+        "  Method : TF-IDF (1-3 grams)  →  LSA  →  K-Means clustering",
+        "  No hardcoded categories or keyword lists."
+    )
 
     if len(df_reg) < 3:
         print("  ⚠  Too few regulatory documents.")
         return {}
 
-    n_topics = min(n_topics, len(df_reg)//2)
-    topics   = _cluster_documents(
-        df_reg, n_clusters=n_topics,
-        label_prefix='REG',
-        ngram_range=(1, 3),
-        max_features=3000,
-        top_phrases=8
+    topics = _cluster_documents(
+        df_reg, n_clusters=min(n_topics, len(df_reg)//2),
+        label_prefix='REG', ngram_range=(1, 3), max_features=3000, top_phrases=8
     )
-
-    reqs = {}
-    for t in topics:
-        reqs[t['label']] = t
+    reqs = _collect_topics(topics)
 
     print(f"\n  Regulatory docs scanned          : {len(df_reg)}")
     print(f"  Regulatory topics AUTO-DISCOVERED: {len(reqs)}\n")
-
-    if reqs:
-        print(f"  {'DISCOVERED TOPIC':<35s}  {'DOCS':>5s}  {'%':>6s}  "
-              f"KEY PHRASES (auto-extracted)")
-        print("  " + "─"*90)
-        for name, d in reqs.items():
-            bar     = "█" * int(d['percentage']/5)
-            phrases = ' | '.join(d['top_phrases'][:3])
-            print(f"  {name:<35s}  {d['document_count']:>5d}  "
-                  f"{d['percentage']:>5.1f}%  {bar}")
-            print(f"  {'':35s}  {'Phrases:':>8s}  \"{phrases}\"")
-            print()
-    else:
-        print("  ⚠  Could not discover regulatory topics from this dataset.")
-
+    _print_discovered_groups('Regulatory Topics', reqs)
     return reqs
 
 
 # ── Step B : Discover company practice topics from promotional documents ─────
 
 def extract_company_practices(df_promo, n_topics=8):
-    print("\n" + "="*80)
-    print("PART 2 — STEP B : DISCOVERING COMPANY PRACTICES  (Fully Dynamic)")
-    print("  Method : TF-IDF (1-3 grams)  →  LSA  →  K-Means clustering")
-    print("  No hardcoded categories or keyword lists.")
-    print("="*80)
+    print_section(
+        "PART 2 — STEP B : DISCOVERING COMPANY PRACTICES  (Fully Dynamic)",
+        "  Method : TF-IDF (1-3 grams)  →  LSA  →  K-Means clustering",
+        "  No hardcoded categories or keyword lists."
+    )
 
     if len(df_promo) < 3:
         print("  ⚠  Too few promotional documents.")
         return {}
 
-    n_topics = min(n_topics, len(df_promo)//2)
-    topics   = _cluster_documents(
-        df_promo, n_clusters=n_topics,
-        label_prefix='PRAC',
-        ngram_range=(1, 3),
-        max_features=3000,
-        top_phrases=8
+    topics = _cluster_documents(
+        df_promo, n_clusters=min(n_topics, len(df_promo)//2),
+        label_prefix='PRAC', ngram_range=(1, 3), max_features=3000, top_phrases=8
     )
-
-    pracs = {}
-    for t in topics:
-        pracs[t['label']] = t
+    pracs = _collect_topics(topics)
 
     print(f"\n  Promotional docs scanned         : {len(df_promo)}")
     print(f"  Company practices AUTO-DISCOVERED: {len(pracs)}\n")
-
-    if pracs:
-        print(f"  {'DISCOVERED PRACTICE':<35s}  {'DOCS':>5s}  {'%':>6s}  "
-              f"KEY PHRASES (auto-extracted)")
-        print("  " + "─"*90)
-        for name, d in pracs.items():
-            bar     = "█" * int(d['percentage']/5)
-            phrases = ' | '.join(d['top_phrases'][:3])
-            print(f"  {name:<35s}  {d['document_count']:>5d}  "
-                  f"{d['percentage']:>5.1f}%  {bar}")
-            print(f"  {'':35s}  {'Phrases:':>8s}  \"{phrases}\"")
-            print()
-    else:
-        print("  ⚠  Could not discover company practices from this dataset.")
-
+    _print_discovered_groups('Company Practices', pracs)
     return pracs
 
 # ── Step C : Dynamic compliance mapping (unchanged from v4) ─────────────────
@@ -528,11 +492,11 @@ def build_dynamic_mapping(reqs, pracs, threshold=0.10):
 
 
 def analyze_compliance(reqs, pracs, threshold=0.10):
-    print("\n" + "="*80)
-    print("PART 2 — STEP C : COMPLIANCE ANALYSIS  (Dynamic Mapping)")
-    print("  Each auto-discovered regulation is matched to the most")
-    print("  similar auto-discovered company practice via cosine similarity.")
-    print("="*80)
+    print_section(
+        "PART 2 — STEP C : COMPLIANCE ANALYSIS  (Dynamic Mapping)",
+        "  Each auto-discovered regulation is matched to the most",
+        "  similar auto-discovered company practice via cosine similarity."
+    )
 
     mapping, scores = build_dynamic_mapping(reqs, pracs, threshold)
 
@@ -774,7 +738,7 @@ def plot_part2_dashboard(reqs, pracs, findings, compliance_rate, dynamic_mapping
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  PART 3 — TACTIC IDENTIFICATION  (unchanged from v4)                    ║
+# ║  PART 3 — TACTIC IDENTIFICATION                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 def discover_tactics_from_text(df_promo, n_tactics=10, top_ngrams=8):
@@ -1201,77 +1165,6 @@ def plot_part3_dashboard(tactics, insights, doc_profiles):
     print("   ✓ Saved: part3_tactic_dashboard.png")
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║  FULL REPORT SAVE                                                        ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def save_full_report(clf_results, reqs, pracs, findings, compliance_rate,
-                     tactics, insights, doc_profiles,
-                     output_file='full_pipeline_report.txt'):
-    lines = []
-    sep = "="*80
-    def h(t):  lines.extend([sep, t, sep, ""])
-    def s(t):  lines.extend(["", t, "-"*len(t)])
-
-    h("OIDA FULL PIPELINE REPORT  v5.0  —  100% DYNAMIC")
-
-    s("PART 1 — CLASSIFICATION RESULTS")
-    lines.append(f"  {'Model':<22s}  {'Accuracy':>10s}  {'F1':>8s}")
-    lines.append("  "+"-"*44)
-    for n, a, f in clf_results:
-        lines.append(f"  {n:<22s}  {a*100:>9.2f}%  {f:>8.4f}")
-
-    s("PART 2A — REGULATORY TOPICS  (auto-discovered)")
-    for cat, d in reqs.items():
-        lines.append(f"\n  {cat}  ({d['document_count']} docs, {d['percentage']:.1f}%)")
-        lines.append(f"    Phrases: {' | '.join(d['top_phrases'][:5])}")
-        if d['examples']: lines.append(f"    e.g. {d['examples'][0]}")
-
-    s("PART 2B — COMPANY PRACTICES  (auto-discovered)")
-    for cat, d in pracs.items():
-        lines.append(f"\n  {cat}  ({d['document_count']} docs, {d['percentage']:.1f}%)")
-        lines.append(f"    Phrases: {' | '.join(d['top_phrases'][:5])}")
-        if d['examples']: lines.append(f"    e.g. {d['examples'][0]}")
-
-    s("PART 2C — COMPLIANCE ANALYSIS")
-    lines.append(f"\n  Score : {compliance_rate:.1f}%  |  "
-                 f"Violations : {sum(1 for f in findings if 'VIOLATION' in f['status'])}")
-    for f in findings:
-        lines.append(f"  {f['regulation']:<30s} → {f['practice']:<30s}  "
-                     f"{f['status']:<22s}  {f['severity']}")
-
-    s("PART 3 — TACTIC IDENTIFICATION")
-    for ins in insights:
-        lines.extend([
-            f"\n  TACTIC #{ins['tactic_id']} : {ins['tactic_name']}",
-            f"  Goal    : {ins['goal']}",
-            f"  Intent  : {ins['intent']}",
-            f"  Evades  : {ins['regulation_evaded']}",
-            f"  Risk    : {ins['risk_level']}",
-            f"  Docs    : {ins['documents_affected']}  ({ins['percentage']:.1f}%)",
-            f"  Phrases : {', '.join(ins['key_phrases'][:4])}",
-            f"  Summary : {ins['plain_english']}",
-        ])
-
-    s("PER-DOCUMENT ATTRIBUTION  (top 15)")
-    for dp in sorted(doc_profiles, key=lambda x: x['tactic_count'],
-                     reverse=True)[:15]:
-        lines.append(f"\n  Doc {dp['doc_id']}  ({dp['tactic_count']} tactics)")
-        for tac in dp['tactics']:
-            lines.append(f"    • {tac['tactic_label']}"
-                         f"  [{tac['intent']}]"
-                         f"  → {tac['regulation_evaded']}")
-
-    lines.extend(["", sep, "END OF REPORT", sep])
-    text = "\n".join(lines)
-    try:
-        with open(output_file, 'w', encoding='utf-8') as f: f.write(text)
-        print(f"\n   ✓ Report saved : {output_file}")
-    except:
-        fb = '/tmp/'+output_file
-        with open(fb, 'w', encoding='utf-8') as f: f.write(text)
-        print(f"\n   ✓ Report saved : {fb}")
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  MAIN                                                                    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -1332,9 +1225,7 @@ def main(filepath):
 
     plot_confusion_matrices(y_test, preds, sorted(df['label'].unique()))
 
-    print("\n" + "="*80)
-    print("PART 1 COMPLETE")
-    print("="*80)
+    print_section("PART 1 COMPLETE")
     print(f"\n   {'Model':<22s}  {'Accuracy':>10s}  {'F1-Macro':>10s}")
     print("   " + "-"*46)
     for n, a, f in clf_results:
@@ -1345,9 +1236,7 @@ def main(filepath):
     df_reg   = df[df['label'] == 'regulatory' ].copy()
     df_sci   = df[df['label'] == 'scientific' ].copy()
 
-    print("\n\n" + "="*80)
-    print("STARTING PART 2 — COMPLIANCE ANALYSIS  (100% Dynamic)")
-    print("="*80)
+    print_section("STARTING PART 2 — COMPLIANCE ANALYSIS  (100% Dynamic)")
     print(f"\n  Promotional : {len(df_promo)}")
     print(f"  Regulatory  : {len(df_reg)}")
     print(f"  Scientific  : {len(df_sci)}")
@@ -1368,9 +1257,7 @@ def main(filepath):
     plot_part2_dashboard(reqs, pracs, findings, compliance_rate, dyn_map)
 
     # ── PART 3 ──────────────────────────────────────────────────────────────
-    print("\n\n" + "="*80)
-    print("STARTING PART 3 — TACTIC IDENTIFICATION  (Fully Dynamic)")
-    print("="*80)
+    print_section("STARTING PART 3 — TACTIC IDENTIFICATION  (Fully Dynamic)")
 
     tactics = discover_tactics_from_text(df_promo, n_tactics=10, top_ngrams=8)
 
@@ -1394,17 +1281,15 @@ def main(filepath):
         doc_profiles, insights = [], []
 
     # ── SAVE ────────────────────────────────────────────────────────────────
-    save_full_report(clf_results, reqs, pracs, findings, compliance_rate,
-                     tactics if tactics else [], insights, doc_profiles)
+    # save_full_report(clf_results, reqs, pracs, findings, compliance_rate,
+    #                  tactics if tactics else [], insights, doc_profiles)
 
     # ── FINAL SUMMARY ───────────────────────────────────────────────────────
     best_acc  = max(a for _, a, _ in clf_results)
     sales_n   = sum(1 for t in (tactics or []) if 'SALES'   in t.get('intent',''))
     evasion_n = sum(1 for t in (tactics or []) if 'EVASION' in t.get('intent','')
                                                    or 'MIXED' in t.get('intent',''))
-    print("\n" + "="*80)
-    print("FULL PIPELINE v5.0 COMPLETE  —  100% DYNAMIC")
-    print("="*80)
+    print_section("FULL PIPELINE v5.0 COMPLETE  —  100% DYNAMIC")
     print(f"\n  PART 1 — Best Accuracy         : {best_acc*100:.2f}%")
     print(f"  PART 2 — Compliance Rate        : {compliance_rate:.1f}%")
     print(f"           Violations Found       : "
