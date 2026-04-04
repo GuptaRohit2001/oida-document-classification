@@ -245,52 +245,6 @@ def train_ensemble(X_train, X_test, y_train, y_test, vec):
     print_metrics('Ensemble', y_test, pred)
     return ens, pred
 
-def train_bilstm(X_train, X_test, y_train, y_test, label_encoder):
-    print_section("PART 1 : BiLSTM")
-    y_tr_enc = label_encoder.transform(y_train)
-    y_te_enc = label_encoder.transform(y_test)
-    y_tr_cat = to_categorical(y_tr_enc)
-    cw = class_weight.compute_class_weight('balanced',
-             classes=np.unique(y_tr_enc), y=y_tr_enc)
-    cw_dict = {i: w for i, w in enumerate(cw)}
-    max_words = min(15000, len(X_train)*10)
-    max_len   = min(400, max(len(str(t).split()) for t in X_train)+50)
-    tok = Tokenizer(num_words=max_words, oov_token="<OOV>")
-    tok.fit_on_texts(X_train)
-    X_tr = pad_sequences(tok.texts_to_sequences(X_train),
-                         maxlen=max_len, padding='post')
-    X_te = pad_sequences(tok.texts_to_sequences(X_test),
-                         maxlen=max_len, padding='post')
-    print(f"\n   Building BiLSTM (vocab={max_words}, seq_len={max_len}) ...")
-    model = Sequential([
-        Embedding(max_words, 150, input_length=max_len, mask_zero=True),
-        SpatialDropout1D(0.2),
-        Bidirectional(LSTM(128, return_sequences=True,
-                           dropout=0.2, recurrent_dropout=0.2)),
-        BatchNormalization(),
-        Bidirectional(LSTM(64, dropout=0.2, recurrent_dropout=0.2)),
-        Dense(128, activation='relu'),
-        BatchNormalization(),
-        Dropout(0.5),
-        Dense(len(label_encoder.classes_), activation='softmax'),
-    ])
-    model.compile(optimizer=Adam(0.001, clipnorm=1.0),
-                  loss='categorical_crossentropy', metrics=['accuracy'])
-    early  = EarlyStopping(monitor='val_accuracy', patience=5,
-                           restore_best_weights=True, verbose=1)
-    reduce = ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                               patience=3, min_lr=1e-6, verbose=1)
-    print("\nTraining BiLSTM ...")
-    model.fit(X_tr, y_tr_cat, validation_split=0.15,
-              epochs=2,
-              batch_size=min(32, len(X_train)//5),
-              callbacks=[early, reduce],
-              class_weight=cw_dict, verbose=1)
-    pred = label_encoder.inverse_transform(
-               np.argmax(model.predict(X_te, verbose=0), axis=1))
-    print_metrics('BiLSTM', y_test, pred)
-    return model, pred
-
 def plot_confusion_matrices(y_test, predictions_dict, labels):
     print("\nPlotting confusion matrices ...")
     n = len(predictions_dict)
@@ -1215,13 +1169,6 @@ def main(filepath):
         clf_results.append(('Ensemble',
                             accuracy_score(y_test, ep),
                             f1_score(y_test, ep, average='macro')))
-
-    if len(X_train) >= 100:
-        _, bp = train_bilstm(X_train, X_test, y_train, y_test, le)
-        preds['BiLSTM'] = bp
-        clf_results.append(('BiLSTM',
-                            accuracy_score(y_test, bp),
-                            f1_score(y_test, bp, average='macro')))
 
     plot_confusion_matrices(y_test, preds, sorted(df['label'].unique()))
 
